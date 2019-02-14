@@ -521,17 +521,33 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
           self.node_group.Delete()
           self.deleted_hosts.add(self.node_group)
 
+  def _ParseDescribeResponse(self, describe_response):
+    """Sets the ID and IP addresses from a response to the describe command.
+
+    Args:
+      describe_response: JSON-loaded response to the describe gcloud command.
+
+    Raises:
+      KeyError, IndexError: If the ID and IP addresses cannot be parsed.
+    """
+    self.id = describe_response['id']
+    network_interface = describe_response['networkInterfaces'][0]
+    self.internal_ip = network_interface['networkIP']
+    self.ip_address = network_interface['accessConfigs'][0]['natIP']
+
+  def _NeedsToParseDescribeResponse(self):
+    """Returns whether the ID and IP addresses still need to be set."""
+    return not self.id or not self.internal_ip or not self.ip_address
+
   @vm_util.Retry()
   def _PostCreate(self):
     """Get the instance's data."""
-    getinstance_cmd = util.GcloudCommand(self, 'compute', 'instances',
-                                         'describe', self.name)
-    stdout, _, _ = getinstance_cmd.Issue()
-    response = json.loads(stdout)
-    self.id = response['id']
-    network_interface = response['networkInterfaces'][0]
-    self.internal_ip = network_interface['networkIP']
-    self.ip_address = network_interface['accessConfigs'][0]['natIP']
+    if self._NeedsToParseDescribeResponse():
+      getinstance_cmd = util.GcloudCommand(self, 'compute', 'instances',
+                                           'describe', self.name)
+      stdout, _, _ = getinstance_cmd.Issue()
+      response = json.loads(stdout)
+      self._ParseDescribeResponse(response)
     if not self.image:
       getdisk_cmd = util.GcloudCommand(
           self, 'compute', 'disks', 'describe', self.name)
@@ -552,9 +568,19 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
                                          'describe', self.name)
     stdout, _, _ = getinstance_cmd.Issue(suppress_warning=True)
     try:
-      json.loads(stdout)
+      response = json.loads(stdout)
     except ValueError:
       return False
+    try:
+      # The VM may exist before we can fully parse the describe response for the
+      # IP address or ID of the VM. For example, if the VM has a status of
+      # provisioning, we can't yet parse the IP address. If this is the case, we
+      # will continue to invoke the describe command in _PostCreate above.
+      # However, if we do have this information now, it's better to stash it and
+      # avoid invoking the describe command again.
+      self._ParseDescribeResponse(response)
+    except (KeyError, IndexError):
+      pass
     return True
 
   def CreateScratchDisk(self, disk_spec):
@@ -594,7 +620,7 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
     self._CreateScratchDiskFromDisks(disk_spec, disks)
 
   def AddMetadata(self, **kwargs):
-    """Adds metadata to the VM via 'gcloud compute instances add-metadata'."""
+    """Adds metadata to the VM and disk."""
     if not kwargs:
       return
     cmd = util.GcloudCommand(self, 'compute', 'instances', 'add-metadata',
@@ -604,6 +630,11 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
       cmd.flags['metadata'] = '{metadata},{kwargs}'.format(
           metadata=cmd.flags['metadata'],
           kwargs=util.FormatTags(kwargs))
+    cmd.Issue()
+
+    cmd = util.GcloudCommand(
+        self, 'compute', 'disks', 'add-labels',
+        '--labels={}'.format(util.MakeFormattedDefaultLabels()), self.name)
     cmd.Issue()
 
   def AllowRemoteAccessPorts(self):
@@ -847,6 +878,24 @@ class WindowsGceVirtualMachine(GceVirtualMachine,
     stdout, _ = self.RemoteCommand('netsh int tcp show global')
     if 'Receive-Side Scaling State          : enabled' in stdout:
       raise GceUnexpectedWindowsAdapterOutputError('RSS failed to disable.')
+
+
+class Windows2012GceVirtualMachine(WindowsGceVirtualMachine,
+                                   windows_virtual_machine.Windows2012Mixin):
+  DEFAULT_IMAGE_FAMILY = 'windows-2012-r2'
+  DEFAULT_IMAGE_PROJECT = 'windows-cloud'
+
+
+class Windows2016GceVirtualMachine(WindowsGceVirtualMachine,
+                                   windows_virtual_machine.Windows2016Mixin):
+  DEFAULT_IMAGE_FAMILY = 'windows-2016'
+  DEFAULT_IMAGE_PROJECT = 'windows-cloud'
+
+
+class Windows2019GceVirtualMachine(WindowsGceVirtualMachine,
+                                   windows_virtual_machine.Windows2019Mixin):
+  DEFAULT_IMAGE_FAMILY = 'windows-2019'
+  DEFAULT_IMAGE_PROJECT = 'windows-cloud'
 
 
 def GenerateDownloadPreprovisionedDataCommand(install_path, module_name,

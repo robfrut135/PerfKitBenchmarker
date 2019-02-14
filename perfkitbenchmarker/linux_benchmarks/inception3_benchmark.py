@@ -133,32 +133,15 @@ def _CreateMetadataDict(benchmark_spec):
   Returns:
     metadata dict
   """
-  metadata = {
-      'tpu_train': benchmark_spec.tpu_train,
-      'tpu_eval': benchmark_spec.tpu_eval,
+  metadata = mnist_benchmark.CreateMetadataDict(benchmark_spec)
+  metadata.update({
       'learning_rate': benchmark_spec.learning_rate,
-      'train_steps': benchmark_spec.train_steps,
-      'iterations': benchmark_spec.iterations,
-      'use_tpu': benchmark_spec.use_tpu,
       'use_data': benchmark_spec.use_data,
       'mode': benchmark_spec.mode,
-      'data_dir': benchmark_spec.data_dir,
-      'model_dir': benchmark_spec.model_dir,
       'save_checkpoints_secs': benchmark_spec.save_checkpoints_secs,
-      'train_batch_size': benchmark_spec.train_batch_size,
-      'eval_batch_size': benchmark_spec.eval_batch_size,
-      'commit': benchmark_spec.commit,
-      'num_shards': benchmark_spec.num_shards,
-      'num_shards_train': benchmark_spec.num_shards_train,
-      'num_shards_eval': benchmark_spec.num_shards_eval,
-      'num_train_images': benchmark_spec.num_train_images,
-      'num_eval_images': benchmark_spec.num_eval_images,
-      'train_epochs': benchmark_spec.train_epochs,
-      'num_examples_per_epoch': benchmark_spec.num_examples_per_epoch,
       'epochs_per_eval': benchmark_spec.epochs_per_eval,
       'steps_per_eval': benchmark_spec.steps_per_eval,
-      'precision': benchmark_spec.precision
-  }
+      'precision': benchmark_spec.precision})
   return metadata
 
 
@@ -177,9 +160,8 @@ def Run(benchmark_spec):
   inception3_benchmark_script = (
       'tpu/models/experimental/inception/inception_v3.py')
   inception3_benchmark_cmd = (
-      'python {script} '
+      '{env_cmd} && python {script} '
       '--learning_rate={learning_rate} '
-      '--train_steps={train_steps} '
       '--iterations={iterations} '
       '--use_tpu={use_tpu} '
       '--use_data={use_data} '
@@ -190,9 +172,9 @@ def Run(benchmark_spec):
       '--train_batch_size={train_batch_size} '
       '--eval_batch_size={eval_batch_size} '
       '--precision={precision}'.format(
+          env_cmd=benchmark_spec.env_cmd,
           script=inception3_benchmark_script,
           learning_rate=benchmark_spec.learning_rate,
-          train_steps=benchmark_spec.train_steps,
           iterations=benchmark_spec.iterations,
           use_tpu=benchmark_spec.use_tpu,
           use_data=benchmark_spec.use_data,
@@ -214,10 +196,12 @@ def Run(benchmark_spec):
   for step in range(steps_per_eval, train_steps + steps_per_eval,
                     steps_per_eval):
     step = min(step, train_steps)
+    inception3_benchmark_cmd_step = '{cmd} --train_steps={step}'.format(
+        cmd=inception3_benchmark_cmd, step=step)
     if benchmark_spec.mode in ('train', 'train_and_eval'):
       inception3_benchmark_train_cmd = (
           '{cmd} --tpu={tpu} --mode=train --num_shards={num_shards}'.format(
-              cmd=inception3_benchmark_cmd,
+              cmd=inception3_benchmark_cmd_step,
               tpu=benchmark_spec.tpu_train,
               num_shards=benchmark_spec.num_shards_train))
       start = time.time()
@@ -225,11 +209,11 @@ def Run(benchmark_spec):
                                               should_log=True)
       elapsed_seconds += (time.time() - start)
       samples.extend(mnist_benchmark.MakeSamplesFromTrainOutput(
-          metadata, stdout + stderr, elapsed_seconds))
+          metadata, stdout + stderr, elapsed_seconds, step))
     if benchmark_spec.mode in ('train_and_eval', 'eval'):
       inception3_benchmark_eval_cmd = (
           '{cmd} --tpu={tpu} --mode=eval --num_shards={num_shards}'.format(
-              cmd=inception3_benchmark_cmd,
+              cmd=inception3_benchmark_cmd_step,
               tpu=benchmark_spec.tpu_eval,
               num_shards=benchmark_spec.num_shards_eval))
       stdout, stderr = vm.RobustRemoteCommand(inception3_benchmark_eval_cmd,

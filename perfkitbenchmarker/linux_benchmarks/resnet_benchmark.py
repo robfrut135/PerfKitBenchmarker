@@ -143,32 +143,15 @@ def _CreateMetadataDict(benchmark_spec):
   Returns:
     metadata dict
   """
-  metadata = {
-      'use_tpu': benchmark_spec.use_tpu,
-      'tpu_train': benchmark_spec.tpu_train,
-      'tpu_eval': benchmark_spec.tpu_eval,
-      'data_dir': benchmark_spec.data_dir,
-      'model_dir': benchmark_spec.model_dir,
+  metadata = mnist_benchmark.CreateMetadataDict(benchmark_spec)
+  metadata.update({
       'depth': benchmark_spec.depth,
       'mode': benchmark_spec.mode,
-      'train_steps': benchmark_spec.train_steps,
-      'train_batch_size': benchmark_spec.train_batch_size,
-      'eval_batch_size': benchmark_spec.eval_batch_size,
-      'iterations': benchmark_spec.iterations,
-      'num_shards': benchmark_spec.num_shards,
-      'num_shards_train': benchmark_spec.num_shards_train,
-      'num_shards_eval': benchmark_spec.num_shards_eval,
       'data_format': benchmark_spec.data_format,
       'precision': benchmark_spec.precision,
-      'commit': benchmark_spec.commit,
       'skip_host_call': benchmark_spec.skip_host_call,
-      'num_train_images': benchmark_spec.num_train_images,
-      'num_eval_images': benchmark_spec.num_eval_images,
-      'train_epochs': benchmark_spec.train_epochs,
-      'num_examples_per_epoch': benchmark_spec.num_examples_per_epoch,
       'epochs_per_eval': benchmark_spec.epochs_per_eval,
-      'steps_per_eval': benchmark_spec.steps_per_eval
-  }
+      'steps_per_eval': benchmark_spec.steps_per_eval})
   return metadata
 
 
@@ -247,7 +230,7 @@ def Run(benchmark_spec):
   vm = benchmark_spec.vms[0]
   resnet_benchmark_script = 'resnet_main.py'
   resnet_benchmark_cmd = (
-      'cd tpu/models/official/resnet && '
+      '{env_cmd} && cd tpu/models/official/resnet && '
       'python {script} '
       '--use_tpu={use_tpu} '
       '--data_dir={data_dir} '
@@ -261,6 +244,7 @@ def Run(benchmark_spec):
       '--skip_host_call={skip_host_call} '
       '--num_train_images={num_train_images} '
       '--num_eval_images={num_eval_images}'.format(
+          env_cmd=benchmark_spec.env_cmd,
           script=resnet_benchmark_script,
           use_tpu=benchmark_spec.use_tpu,
           data_dir=benchmark_spec.data_dir,
@@ -299,7 +283,7 @@ def Run(benchmark_spec):
                                               should_log=True)
       elapsed_seconds += (time.time() - start)
       samples.extend(mnist_benchmark.MakeSamplesFromTrainOutput(
-          metadata, stdout + stderr, elapsed_seconds))
+          metadata, stdout + stderr, elapsed_seconds, step))
     if benchmark_spec.mode in ('train_and_eval', 'eval'):
       resnet_benchmark_eval_cmd = (
           '{cmd} --tpu={tpu} --mode=eval --num_cores={num_cores}'.format(

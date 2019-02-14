@@ -151,6 +151,9 @@ flags.DEFINE_string('image', None, 'Default image that will be '
 flags.DEFINE_string('run_uri', None, 'Name of the Run. If provided, this '
                     'should be alphanumeric and less than or equal to %d '
                     'characters in length.' % MAX_RUN_URI_LENGTH)
+flags.DEFINE_boolean('use_pkb_logging', True, 'Whether to use PKB-specific '
+                     'logging handlers. Disabling this will use the standard '
+                     'ABSL logging directly.')
 
 
 def GetCurrentUser():
@@ -312,10 +315,10 @@ flags.DEFINE_integer(
     'providers.')
 flags.DEFINE_integer(
     'persistent_timeout_minutes', 240,
-    'An upper bound on the time in minutes that resources left behind by the  '
-    'benchmark is expected run. Some benchmarks purposefully create resources '
-    'for other benchmarks to use.   Persistent timeout guages who long '
-    'these shared should live.')
+    'An upper bound on the time in minutes that resources left behind by the '
+    'benchmark. Some benchmarks purposefully create resources for other '
+    'benchmarks to use. Persistent timeout specifies how long these shared '
+    'resources should live.')
 flags.DEFINE_bool('disable_interrupt_moderation', False,
                   'Turn off the interrupt moderation networking feature')
 flags.DEFINE_bool('disable_rss', False,
@@ -513,6 +516,10 @@ def DoProvisionPhase(spec, timer):
   spec.ConstructDpbService()
   spec.ConstructManagedRelationalDb()
   spec.ConstructVirtualMachines()
+  # CapacityReservations need to be constructed after VirtualMachines because
+  # it needs information about the VMs (machine type, count, zone, etc). The
+  # CapacityReservations will be provisioned before VMs.
+  spec.ConstructCapacityReservations()
   spec.ConstructTpu()
   spec.ConstructEdwService()
   spec.ConstructCloudRedis()
@@ -612,6 +619,9 @@ def DoRunPhase(spec, collector, timer):
 def DoCleanupPhase(spec, timer):
   """Performs the Cleanup phase of benchmark execution.
 
+  Cleanup phase work should be delegated to spec.BenchmarkCleanup to allow
+  non-PKB based cleanup if needed.
+
   Args:
     spec: The BenchmarkSpec created for the benchmark.
     timer: An IntervalTimer that measures the start and stop times of the
@@ -627,6 +637,9 @@ def DoCleanupPhase(spec, timer):
 
 def DoTeardownPhase(spec, timer):
   """Performs the Teardown phase of benchmark execution.
+
+  Teardown phase work should be delegated to spec.Delete to allow non-PKB based
+  teardown if needed.
 
   Args:
     spec: The BenchmarkSpec created for the benchmark.
@@ -755,10 +768,9 @@ def RunBenchmark(spec, collector):
         # immediate feedback, then re-throw.
         logging.exception('Error during benchmark %s', spec.name)
         if FLAGS.create_failed_run_samples:
-          collector.AddSamples(MakeFailedRunSample(spec, str(e),
-                                                   current_run_stage),
-                               spec.name,
-                               spec)
+          collector.AddSamples(MakeFailedRunSample(
+              spec, str(e), current_run_stage), spec.name, spec)
+
         # If the particular benchmark requests us to always call cleanup, do it
         # here.
         if stages.CLEANUP in FLAGS.run_stage and spec.always_call_cleanup:
@@ -900,11 +912,12 @@ def SetUpPKB():
 
   # Initialize logging.
   vm_util.GenTempDir()
-  log_util.ConfigureLogging(
-      stderr_log_level=log_util.LOG_LEVELS[FLAGS.log_level],
-      log_path=vm_util.PrependTempDir(LOG_FILE_NAME),
-      run_uri=FLAGS.run_uri,
-      file_log_level=log_util.LOG_LEVELS[FLAGS.file_log_level])
+  if FLAGS.use_pkb_logging:
+    log_util.ConfigureLogging(
+        stderr_log_level=log_util.LOG_LEVELS[FLAGS.log_level],
+        log_path=vm_util.PrependTempDir(LOG_FILE_NAME),
+        run_uri=FLAGS.run_uri,
+        file_log_level=log_util.LOG_LEVELS[FLAGS.file_log_level])
   logging.info('PerfKitBenchmarker version: %s', version.VERSION)
 
   # Translate deprecated flags and log all provided flag values.
@@ -939,6 +952,16 @@ def SetUpPKB():
 
   benchmark_lookup.SetBenchmarkModuleFunction(benchmark_sets.BenchmarkModule)
   package_lookup.SetPackageModuleFunction(benchmark_sets.PackageModule)
+
+  # Update max_concurrent_threads to use at least as many threads as VMs. This
+  # is important for the cluster_boot benchmark where we want to launch the VMs
+  # in parallel.
+  if not FLAGS.max_concurrent_threads:
+    FLAGS.max_concurrent_threads = max(
+        background_tasks.MAX_CONCURRENT_THREADS,
+        FLAGS.num_vms)
+    logging.info('Setting --max_concurrent_threads=%d.',
+                 FLAGS.max_concurrent_threads)
 
 
 def RunBenchmarkTasksInSeries(tasks):

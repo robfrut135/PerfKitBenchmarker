@@ -1,4 +1,4 @@
-# Copyright 2017 PerfKitBenchmarker Authors. All rights reserved.
+# Copyright 2019 PerfKitBenchmarker Authors. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import threading
 import uuid
 
 from perfkitbenchmarker import benchmark_status
+from perfkitbenchmarker import capacity_reservation
 from perfkitbenchmarker import cloud_redis
 from perfkitbenchmarker import cloud_tpu
 from perfkitbenchmarker import container_service
@@ -139,6 +140,7 @@ class BenchmarkSpec(object):
     self.nfs_service = None
     self.app_groups = {}
     self._zone_index = 0
+    self.capacity_reservations = []
 
     # Modules can't be pickled, but functions can, so we store the functions
     # necessary to run the benchmark.
@@ -269,11 +271,14 @@ class BenchmarkSpec(object):
       disk_spec = group_spec.disk_spec
       if disk_spec.disk_type != disk.NFS:
         continue
-      cloud = group_spec.cloud
-      providers.LoadProvider(cloud)
-      nfs_class = nfs_service.GetNfsServiceClass(cloud)
-      self.nfs_service = nfs_class(disk_spec, group_spec.vm_spec.zone)
-      logging.info('NFS service %s', self.nfs_service)
+      if disk_spec.nfs_ip_address:
+        self.nfs_service = nfs_service.StaticNfsService(disk_spec)
+      else:
+        cloud = group_spec.cloud
+        providers.LoadProvider(cloud)
+        nfs_class = nfs_service.GetNfsServiceClass(cloud)
+        self.nfs_service = nfs_class(disk_spec, group_spec.vm_spec.zone)
+      logging.debug('NFS service %s', self.nfs_service)
       break
 
   def ConstructVirtualMachineGroup(self, group_name, group_spec):
@@ -335,6 +340,18 @@ class BenchmarkSpec(object):
       vms.append(vm)
 
     return vms
+
+  def ConstructCapacityReservations(self):
+    """Construct capacity reservations for each VM group."""
+    if not FLAGS.use_capacity_reservations:
+      return
+    for vm_group in self.vm_groups.itervalues():
+      cloud = vm_group[0].CLOUD
+      providers.LoadProvider(cloud)
+      capacity_reservation_class = capacity_reservation.GetResourceClass(
+          cloud)
+      self.capacity_reservations.append(
+          capacity_reservation_class(vm_group))
 
   def _CheckBenchmarkSupport(self, cloud):
     """Throw an exception if the benchmark isn't supported."""
@@ -430,6 +447,17 @@ class BenchmarkSpec(object):
 
   def Provision(self):
     """Prepares the VMs and networks necessary for the benchmark to run."""
+    # Create capacity reservations if the cloud supports it. Note that the
+    # capacity reservation class may update the VMs themselves. This is true
+    # on AWS, because the VM needs to be aware of the capacity resrevation id
+    # before its Create() method is called. Furthermore, if the user does not
+    # specify an AWS zone, but a region instead, the AwsCapacityReservation
+    # class will make a reservation in a zone that has sufficient capacity.
+    # In this case the VM's zone attribute, and the VMs network instance
+    # need to be updated as well.
+    if self.capacity_reservations:
+      vm_util.RunThreaded(lambda res: res.Create(), self.capacity_reservations)
+
     # Sort networks into a guaranteed order of creation based on dict key.
     # There is a finite limit on the number of threads that are created to
     # provision networks. Until support is added to provision resources in an
@@ -457,12 +485,21 @@ class BenchmarkSpec(object):
       self.nfs_service.Create()
 
     if self.vms:
-      vm_util.RunThreaded(self.PrepareVm, self.vms)
-      sshable_vms = [vm for vm in self.vms if vm.OS_TYPE != os_types.WINDOWS]
+
+      # We separate out creating, booting, and preparing the VMs into two phases
+      # so that we don't slow down the creation of all the VMs by running
+      # commands on the VMs that booted.
+      vm_util.RunThreaded(self.CreateAndBootVm, self.vms)
+      vm_util.RunThreaded(self.PrepareVmAfterBoot, self.vms)
+
+      sshable_vms = [
+          vm for vm in self.vms if vm.OS_TYPE not in os_types.WINDOWS_OS_TYPES
+      ]
       sshable_vm_groups = {}
       for group_name, group_vms in self.vm_groups.iteritems():
         sshable_vm_groups[group_name] = [
-            vm for vm in group_vms if vm.OS_TYPE != os_types.WINDOWS
+            vm for vm in group_vms
+            if vm.OS_TYPE not in os_types.WINDOWS_OS_TYPES
         ]
       vm_util.GenerateSSHConfig(sshable_vms, sshable_vm_groups)
     if self.spark_service:
@@ -504,6 +541,16 @@ class BenchmarkSpec(object):
       self.edw_service.Delete()
     if self.nfs_service:
       self.nfs_service.Delete()
+
+    # Note: It is ok to delete capacity reservations before deleting the VMs,
+    # and will actually save money (mere seconds of usage).
+    if self.capacity_reservations:
+      try:
+        vm_util.RunThreaded(lambda reservation: reservation.Delete(),
+                            self.capacity_reservations)
+      except Exception:  # pylint: disable=broad-except
+        logging.exception('Got an exception deleting CapacityReservations. '
+                          'Attempting to continue tearing down.')
 
     if self.vms:
       try:
@@ -603,32 +650,46 @@ class BenchmarkSpec(object):
 
     return vm_class(vm_spec)
 
-  def PrepareVm(self, vm):
-    """Creates a single VM and prepares a scratch disk if required.
+  def CreateAndBootVm(self, vm):
+    """Creates a single VM and waits for boot to complete.
 
     Args:
         vm: The BaseVirtualMachine object representing the VM.
     """
+    vm.Create()
+    logging.info('VM: %s', vm.ip_address)
+    logging.info('Waiting for boot completion.')
+    vm.AllowRemoteAccessPorts()
+    vm.WaitForBootCompletion()
+
+  def PrepareVmAfterBoot(self, vm):
+    """Prepares a VM after it has booted.
+
+    This function will prepare a scratch disk if required.
+
+    Args:
+        vm: The BaseVirtualMachine object representing the VM.
+
+    Raises:
+        Exception: If --vm_metadata is malformed.
+    """
     vm_metadata = {
-        'benchmark': self.name,
-        'perfkit_uuid': self.uuid,
-        'benchmark_uid': self.uid,
+        'benchmark':
+            self.name,
+        'perfkit_uuid':
+            self.uuid,
+        'benchmark_uid':
+            self.uid,
         'create_time_utc':
-        datetime.datetime.utcnow().strftime(METADATA_TIME_FORMAT),
-        'owner': FLAGS.owner
+            datetime.datetime.utcfromtimestamp(vm.create_start_time),
+        'owner':
+            FLAGS.owner
     }
     for item in FLAGS.vm_metadata:
       if ':' not in item:
         raise Exception('"%s" not in expected key:value format' % item)
       key, value = item.split(':', 1)
       vm_metadata[key] = value
-
-    vm.Create()
-
-    logging.info('VM: %s', vm.ip_address)
-    logging.info('Waiting for boot completion.')
-    vm.AllowRemoteAccessPorts()
-    vm.WaitForBootCompletion()
     vm.AddMetadata(**vm_metadata)
     vm.OnStartup()
     if any((spec.disk_type == disk.LOCAL for spec in vm.disk_specs)):
@@ -638,7 +699,10 @@ class BenchmarkSpec(object):
         vm.CreateRamDisk(disk_spec)
       else:
         vm.CreateScratchDisk(disk_spec)
-
+      # TODO(user): Simplify disk logic.
+      if disk_spec.num_striped_disks > 1:
+        # scratch disks has already been created and striped together.
+        break
     # This must come after Scratch Disk creation to support the
     # Containerized VM case
     vm.PrepareVMEnvironment()

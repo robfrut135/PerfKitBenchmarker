@@ -84,6 +84,9 @@ flags.DEFINE_boolean('simulate_maintenance', False,
 flags.DEFINE_integer('simulate_maintenance_delay', 0,
                      'The number of seconds to wait to start simulating '
                      'maintenance.')
+flags.DEFINE_boolean('reuse_ssh_connections', True,
+                     'Whether to reuse SSH connections rather than '
+                     'restablishing a connection for each remote command.')
 
 
 class IpAddressSubset(object):
@@ -191,6 +194,13 @@ def GetSshOptions(ssh_key_filename, connect_timeout=5):
   ]
   if FLAGS.use_ipv6:
     options.append('-6')
+  if FLAGS.reuse_ssh_connections:
+    control_path = os.path.join(temp_dir.GetSshConnectionsDir(), '%C')
+    options.extend([
+        '-o', 'ControlPath="%s"' % control_path,
+        '-o', 'ControlMaster=auto',
+        '-o', 'ControlPersist=10m'
+    ])
   options.extend(FLAGS.ssh_options)
 
   return options
@@ -408,14 +418,14 @@ def ParseTimeCommandResult(command_result):
   return time_in_seconds
 
 
-def ShouldRunOnExternalIpAddress():
+def ShouldRunOnExternalIpAddress(ip_type=None):
   """Returns whether a test should be run on an instance's external IP."""
-  return FLAGS.ip_addresses in (IpAddressSubset.EXTERNAL,
-                                IpAddressSubset.BOTH,
-                                IpAddressSubset.REACHABLE)
+  ip_type_to_check = ip_type or FLAGS.ip_addresses
+  return ip_type_to_check in (IpAddressSubset.EXTERNAL, IpAddressSubset.BOTH,
+                              IpAddressSubset.REACHABLE)
 
 
-def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm):
+def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm, ip_type=None):
   """Returns whether a test should be run on an instance's internal IP.
 
   Based on the command line flag --ip_addresses. Internal IP addresses are used
@@ -428,14 +438,15 @@ def ShouldRunOnInternalIpAddress(sending_vm, receiving_vm):
   Args:
     sending_vm: VirtualMachine. The client.
     receiving_vm: VirtualMachine. The server.
+    ip_type: optional ip_type to use instead of what is set in the FLAGS
 
   Returns:
     Whether a test should be run on an instance's internal IP.
   """
-  return (FLAGS.ip_addresses in (IpAddressSubset.BOTH,
-                                 IpAddressSubset.INTERNAL) or
-          (FLAGS.ip_addresses == IpAddressSubset.REACHABLE and
-           sending_vm.IsReachable(receiving_vm)))
+  ip_type_to_check = ip_type or FLAGS.ip_addresses
+  return (ip_type_to_check in (IpAddressSubset.BOTH, IpAddressSubset.INTERNAL)
+          or (ip_type_to_check == IpAddressSubset.REACHABLE and
+              sending_vm.IsReachable(receiving_vm)))
 
 
 def GetLastRunUri():
@@ -570,3 +581,13 @@ def SetupSimulatedMaintenance(vm):
     t = threading.Thread(target=_SimulateMaintenance)
     t.daemon = True
     t.start()
+
+
+def CopyFileBetweenVms(filename, src_vm, src_path, dest_vm, dest_path):
+  """Copies a file from the src_vm to the dest_vm."""
+  with tempfile.NamedTemporaryFile() as tf:
+    temp_path = tf.name
+    src_vm.RemoteCopy(
+        temp_path, os.path.join(src_path, filename), copy_to=False)
+    dest_vm.RemoteCopy(
+        temp_path, os.path.join(dest_path, filename), copy_to=True)

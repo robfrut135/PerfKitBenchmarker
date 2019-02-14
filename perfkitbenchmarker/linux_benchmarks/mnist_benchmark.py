@@ -131,6 +131,7 @@ def _UpdateBenchmarkSpecWithFlags(benchmark_spec):
   benchmark_spec.eval_steps = int(
       benchmark_spec.eval_epochs * benchmark_spec.num_examples_per_epoch)
   benchmark_spec.precision = FLAGS.tpu_precision
+  benchmark_spec.env_cmd = 'export PYTHONPATH=$PYTHONPATH:$PWD/tpu/models'
 
 
 def Prepare(benchmark_spec):
@@ -180,7 +181,7 @@ def Prepare(benchmark_spec):
                      login_shell=True)
 
 
-def _CreateMetadataDict(benchmark_spec):
+def CreateMetadataDict(benchmark_spec):
   """Create metadata dict to be used in run results.
 
   Args:
@@ -237,13 +238,14 @@ def ExtractThroughput(regex, output, metadata, metric, unit):
   return samples
 
 
-def MakeSamplesFromTrainOutput(metadata, output, elapsed_seconds):
+def MakeSamplesFromTrainOutput(metadata, output, elapsed_seconds, step):
   """Create a sample containing training metrics.
 
   Args:
     metadata: dict contains all the metadata that reports.
     output: string, command output
     elapsed_seconds: float, elapsed seconds from saved checkpoint.
+    step: int, the global steps in the training process.
 
   Example output:
     perfkitbenchmarker/tests/linux_benchmarks/mnist_benchmark_test.py
@@ -253,7 +255,6 @@ def MakeSamplesFromTrainOutput(metadata, output, elapsed_seconds):
   """
   samples = []
   metadata_copy = metadata.copy()
-  step = int(regex_util.ExtractAllMatches(r'step = (\d+)', output).pop())
   metadata_copy['step'] = int(step)
   metadata_copy['epoch'] = step / metadata['num_examples_per_epoch']
   metadata_copy['elapsed_seconds'] = elapsed_seconds
@@ -337,11 +338,11 @@ def Run(benchmark_spec):
     mnist_benchmark_cmd = '{env} {cmd}'.format(
         env=tensorflow.GetEnvironmentVars(vm), cmd=mnist_benchmark_cmd)
   samples = []
-  metadata = _CreateMetadataDict(benchmark_spec)
+  metadata = CreateMetadataDict(benchmark_spec)
   if benchmark_spec.train_steps:
     mnist_benchmark_train_cmd = (
         '{cmd} --tpu={tpu} --use_tpu={use_tpu} --train_steps={train_steps} '
-        '--num_shards={num_shards}'.format(
+        '--num_shards={num_shards} --noenable_predict'.format(
             cmd=mnist_benchmark_cmd,
             tpu=benchmark_spec.tpu_train,
             use_tpu=benchmark_spec.use_tpu,
@@ -351,8 +352,8 @@ def Run(benchmark_spec):
     stdout, stderr = vm.RobustRemoteCommand(mnist_benchmark_train_cmd,
                                             should_log=True)
     elapsed_seconds = (time.time() - start)
-    samples.extend(MakeSamplesFromTrainOutput(metadata, stdout + stderr,
-                                              elapsed_seconds))
+    samples.extend(MakeSamplesFromTrainOutput(
+        metadata, stdout + stderr, elapsed_seconds, benchmark_spec.train_steps))
   if benchmark_spec.eval_steps:
     mnist_benchmark_eval_cmd = (
         '{cmd} --tpu="" --use_tpu=False --eval_steps={eval_steps}'.format(
